@@ -118,7 +118,7 @@ Integrating Dear ImGui within your custom engine is a matter of 1) wiring mouse/
 Officially maintained backends/bindings (in repository):
 - Renderers: DirectX9, DirectX10, DirectX11, DirectX12, Metal, OpenGL/ES/ES2, SDL_Renderer, Vulkan, WebGPU.
 - Platforms: GLFW, SDL2, Win32, Glut, OSX, Android.
-- Frameworks: Emscripten, Allegro5, Marmalade.
+- Frameworks: Allegro5, Emscripten.
 
 [Third-party backends/bindings](https://github.com/ocornut/imgui/wiki/Bindings) wiki page:
 - Languages: C, C# and: Beef, ChaiScript, Crystal, D, Go, Haskell, Haxe/hxcpp, Java, JavaScript, Julia, Kotlin, Lobster, Lua, Odin, Pascal, PureBasic, Python, Ruby, Rust, Swift...
@@ -132,7 +132,7 @@ Also see [Wiki](https://github.com/ocornut/imgui/wiki) for more links and ideas.
 
 ### Upcoming Changes
 
-Some of the goals for 2021 are:
+Some of the goals for 2022 are:
 - Work on Docking (see [#2109](https://github.com/ocornut/imgui/issues/2109), in public [docking](https://github.com/ocornut/imgui/tree/docking) branch)
 - Work on Multi-Viewport / Multiple OS windows. (see [#1542](https://github.com/ocornut/imgui/issues/1542), in public [docking](https://github.com/ocornut/imgui/tree/docking) branch looking for feedback)
 - Work on gamepad/keyboard controls. (see [#787](https://github.com/ocornut/imgui/issues/787))
