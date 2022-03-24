@@ -1357,8 +1357,10 @@ void ImGuiIO::SetKeyEventNativeData(ImGuiKey key, int native_keycode, int native
     // Build native->imgui map so old user code can still call key functions with native 0..511 values.
 #ifndef IMGUI_DISABLE_OBSOLETE_KEYIO
     const int legacy_key = (native_legacy_index != -1) ? native_legacy_index : native_keycode;
-    if (ImGui::IsLegacyKey(legacy_key))
-        KeyMap[legacy_key] = key;
+    if (!ImGui::IsLegacyKey(legacy_key))
+        return;
+    KeyMap[legacy_key] = key;
+    KeyMap[key] = legacy_key;
 #else
     IM_UNUSED(key);
     IM_UNUSED(native_legacy_index);
@@ -1686,7 +1688,11 @@ const char* ImStrSkipBlank(const char* str)
 // designed using two-passes worst case, which probably could be improved using the stbsp_vsprintfcb() function.)
 #ifdef IMGUI_USE_STB_SPRINTF
 #define STB_SPRINTF_IMPLEMENTATION
+#ifdef IMGUI_STB_SPRINTF_FILENAME
+#include IMGUI_STB_SPRINTF_FILENAME
+#else
 #include "stb_sprintf.h"
+#endif
 #endif
 
 #if defined(_MSC_VER) && !defined(vsnprintf)
@@ -2648,6 +2654,7 @@ bool ImGuiListClipper::Step()
     ImGuiContext& g = *GImGui;
     ImGuiWindow* window = g.CurrentWindow;
     ImGuiListClipperData* data = (ImGuiListClipperData*)TempData;
+    IM_ASSERT(data != NULL && "Called ImGuiListClipper::Step() too many times, or before ImGuiListClipper::Begin() ?");
 
     ImGuiTable* table = g.CurrentTable;
     if (table && table->IsInsideRow)
@@ -4060,6 +4067,8 @@ void ImGui::UpdateMouseMovingWindowEndFrame()
     }
 }
 
+// This is called during NewFrame()->UpdateViewportsNewFrame() only.
+// Need to keep in sync with SetWindowPos()
 static void TranslateWindow(ImGuiWindow* window, const ImVec2& delta)
 {
     window->Pos += delta;
@@ -4069,6 +4078,7 @@ static void TranslateWindow(ImGuiWindow* window, const ImVec2& delta)
     window->DC.CursorPos += delta;
     window->DC.CursorStartPos += delta;
     window->DC.CursorMaxPos += delta;
+    window->DC.IdealMaxPos += delta;
 }
 
 static void ScaleWindow(ImGuiWindow* window, float scale)
@@ -4094,9 +4104,9 @@ static void ImGui::UpdateKeyboardInputs()
 #ifndef IMGUI_DISABLE_OBSOLETE_KEYIO
     if (io.BackendUsingLegacyKeyArrays == 0)
     {
-        // Backend used new io.AddKeyEvent() API: Good! Verify that old arrays are never written too.
-        for (int n = 0; n < IM_ARRAYSIZE(io.KeysDown); n++)
-            IM_ASSERT(io.KeysDown[n] == false && "Backend needs to either only use io.AddKeyEvent(), either only fill legacy io.KeysDown[] + io.KeyMap[]. Not both!");
+        // Backend used new io.AddKeyEvent() API: Good! Verify that old arrays are never written to externally.
+        for (int n = 0; n < ImGuiKey_LegacyNativeKey_END; n++)
+            IM_ASSERT((io.KeysDown[n] == false || IsKeyDown(n)) && "Backend needs to either only use io.AddKeyEvent(), either only fill legacy io.KeysDown[] + io.KeyMap[]. Not both!");
     }
     else
     {
@@ -4119,6 +4129,8 @@ static void ImGui::UpdateKeyboardInputs()
                 const ImGuiKey key = (ImGuiKey)(io.KeyMap[n] != -1 ? io.KeyMap[n] : n);
                 IM_ASSERT(io.KeyMap[n] == -1 || IsNamedKey(key));
                 io.KeysData[key].Down = io.KeysDown[n];
+                if (key != n)
+                    io.KeysDown[key] = io.KeysDown[n]; // Allow legacy code using io.KeysDown[GetKeyIndex()] with old backends
                 io.BackendUsingLegacyKeyArrays = 1;
             }
         if (io.BackendUsingLegacyKeyArrays == 1)
@@ -4636,11 +4648,11 @@ void ImGui::Initialize(ImGuiContext* context)
         ini_handler.ReadLineFn = WindowSettingsHandler_ReadLine;
         ini_handler.ApplyAllFn = WindowSettingsHandler_ApplyAll;
         ini_handler.WriteAllFn = WindowSettingsHandler_WriteAll;
-        g.SettingsHandlers.push_back(ini_handler);
+        AddSettingsHandler(&ini_handler);
     }
 
     // Add .ini handle for ImGuiTable type
-    TableSettingsInstallHandler(context);
+    TableSettingsAddSettingsHandler();
 
     // Create default viewport
     ImGuiViewportP* viewport = IM_NEW(ImGuiViewportP)();
@@ -6010,8 +6022,8 @@ static inline void ClampWindowRect(ImGuiWindow* window, const ImRect& visibility
 {
     ImGuiContext& g = *GImGui;
     ImVec2 size_for_clamping = window->Size;
-    if (g.IO.ConfigWindowsMoveFromTitleBarOnly && !(window->Flags & ImGuiWindowFlags_NoTitleBar))
-        size_for_clamping.y = window->TitleBarHeight();
+    if (g.IO.ConfigWindowsMoveFromTitleBarOnly && (!(window->Flags & ImGuiWindowFlags_NoTitleBar) || window->DockNodeAsHost))
+        size_for_clamping.y = ImGui::GetFrameHeight(); // Not using window->TitleBarHeight() as DockNodeAsHost will report 0.0f here.
     window->Pos = ImClamp(window->Pos, visibility_rect.Min - size_for_clamping, visibility_rect.Max);
 }
 
@@ -7665,6 +7677,7 @@ void ImGui::SetWindowPos(ImGuiWindow* window, const ImVec2& pos, ImGuiCond cond)
     const ImVec2 old_pos = window->Pos;
     window->Pos = ImFloor(pos);
     ImVec2 offset = window->Pos - old_pos;
+    // FIXME: share code with TranslateWindow(), need to confirm whether the 3 rect modified by TranslateWindow() are desirable here.
     window->DC.CursorPos += offset;         // As we happen to move the window while it is being appended to (which is a bad idea - will smear) let's at least offset the cursor
     window->DC.CursorMaxPos += offset;      // And more importantly we need to offset CursorMaxPos/CursorStartPos this so ContentSize calculation doesn't get affected.
     window->DC.IdealMaxPos += offset;
@@ -8391,8 +8404,18 @@ static const char* GetInputSourceName(ImGuiInputSource source)
     return input_source_names[source];
 }
 
+/*static void DebugLogInputEvent(const char* prefix, const ImGuiInputEvent* e)
+{
+    if (e->Type == ImGuiInputEventType_MousePos)    { IMGUI_DEBUG_LOG("%s: MousePos (%.1f %.1f)\n", prefix, e->MousePos.PosX, e->MousePos.PosY); return; }
+    if (e->Type == ImGuiInputEventType_MouseButton) { IMGUI_DEBUG_LOG("%s: MouseButton %d %s\n", prefix, e->MouseButton.Button, e->MouseButton.Down ? "Down" : "Up"); return; }
+    if (e->Type == ImGuiInputEventType_MouseWheel)  { IMGUI_DEBUG_LOG("%s: MouseWheel (%.1f %.1f)\n", prefix, e->MouseWheel.WheelX, e->MouseWheel.WheelY); return; }
+    if (e->Type == ImGuiInputEventType_Key)         { IMGUI_DEBUG_LOG("%s: Key \"%s\" %s\n", prefix, ImGui::GetKeyName(e->Key.Key), e->Key.Down ? "Down" : "Up"); return; }
+    if (e->Type == ImGuiInputEventType_Text)        { IMGUI_DEBUG_LOG("%s: Text: %c (U+%08X)\n", prefix, e->Text.Char, e->Text.Char); return; }
+    if (e->Type == ImGuiInputEventType_Focus)       { IMGUI_DEBUG_LOG("%s: AppFocused %d\n", prefix, e->AppFocused.Focused); return; }
+}*/
 
 // Process input queue
+// We always call this with the value of 'bool g.IO.ConfigInputTrickleEventQueue'.
 // - trickle_fast_inputs = false : process all events, turn into flattened input state (e.g. successive down/up/down/up will be lost)
 // - trickle_fast_inputs = true  : process as many events as possible (successive down/up/down/up will be trickled over several frames so nothing is lost) (new feature in 1.87)
 void ImGui::UpdateInputEvents(bool trickle_fast_inputs)
@@ -8400,7 +8423,12 @@ void ImGui::UpdateInputEvents(bool trickle_fast_inputs)
     ImGuiContext& g = *GImGui;
     ImGuiIO& io = g.IO;
 
-    bool mouse_moved = false, mouse_wheeled = false, key_changed = false, text_inputed = false;
+    // Only trickle chars<>key when working with InputText()
+    // FIXME: InputText() could parse event trail?
+    // FIXME: Could specialize chars<>keys trickling rules for control keys (those not typically associated to characters)
+    const bool trickle_interleaved_keys_and_text = (trickle_fast_inputs && g.WantTextInputNextFrame == 1);
+
+    bool mouse_moved = false, mouse_wheeled = false, key_changed = false, text_inputted = false;
     int  mouse_button_changed = 0x00;
     ImBitArray<ImGuiKey_KeysData_SIZE> key_changed_mask;
 
@@ -8416,7 +8444,7 @@ void ImGui::UpdateInputEvents(bool trickle_fast_inputs)
             if (io.MousePos.x != event_pos.x || io.MousePos.y != event_pos.y)
             {
                 // Trickling Rule: Stop processing queued events if we already handled a mouse button change
-                if (trickle_fast_inputs && (mouse_button_changed != 0 || mouse_wheeled || key_changed || text_inputed))
+                if (trickle_fast_inputs && (mouse_button_changed != 0 || mouse_wheeled || key_changed || text_inputted))
                     break;
                 io.MousePos = event_pos;
                 mouse_moved = true;
@@ -8460,7 +8488,7 @@ void ImGui::UpdateInputEvents(bool trickle_fast_inputs)
             if (keydata->Down != e->Key.Down || keydata->AnalogValue != e->Key.AnalogValue)
             {
                 // Trickling Rule: Stop processing queued events if we got multiple action on the same button
-                if (trickle_fast_inputs && keydata->Down != e->Key.Down && (key_changed_mask.TestBit(keydata_index) || text_inputed || mouse_button_changed != 0))
+                if (trickle_fast_inputs && keydata->Down != e->Key.Down && (key_changed_mask.TestBit(keydata_index) || text_inputted || mouse_button_changed != 0))
                     break;
                 keydata->Down = e->Key.Down;
                 keydata->AnalogValue = e->Key.AnalogValue;
@@ -8475,16 +8503,24 @@ void ImGui::UpdateInputEvents(bool trickle_fast_inputs)
                     if (key == ImGuiKey_ModSuper) { io.KeySuper = keydata->Down; }
                     io.KeyMods = GetMergedKeyModFlags();
                 }
+
+                // Allow legacy code using io.KeysDown[GetKeyIndex()] with new backends
+#ifndef IMGUI_DISABLE_OBSOLETE_KEYIO
+                io.KeysDown[key] = keydata->Down;
+                if (io.KeyMap[key] != -1)
+                    io.KeysDown[io.KeyMap[key]] = keydata->Down;
+#endif
             }
         }
         else if (e->Type == ImGuiInputEventType_Text)
         {
             // Trickling Rule: Stop processing queued events if keys/mouse have been interacted with
-            if (trickle_fast_inputs && (key_changed || mouse_button_changed != 0 || mouse_moved || mouse_wheeled))
+            if (trickle_fast_inputs && ((key_changed && trickle_interleaved_keys_and_text) || mouse_button_changed != 0 || mouse_moved || mouse_wheeled))
                 break;
             unsigned int c = e->Text.Char;
             io.InputQueueCharacters.push_back(c <= IM_UNICODE_CODEPOINT_MAX ? (ImWchar)c : IM_UNICODE_CODEPOINT_INVALID);
-            text_inputed = true;
+            if (trickle_interleaved_keys_and_text)
+                text_inputted = true;
         }
         else if (e->Type == ImGuiInputEventType_Focus)
         {
@@ -8502,6 +8538,11 @@ void ImGui::UpdateInputEvents(bool trickle_fast_inputs)
     //if (event_n != 0) IMGUI_DEBUG_LOG("Processed: %d / Remaining: %d\n", event_n, g.InputEventsQueue.Size - event_n);
     for (int n = 0; n < event_n; n++)
         g.InputEventsTrail.push_back(g.InputEventsQueue[n]);
+
+    // [DEBUG]
+    /*if (event_n != 0)
+        for (int n = 0; n < g.InputEventsQueue.Size; n++)
+            DebugLogInputEvent(n < event_n ? "Processed" : "Remaining", &g.InputEventsQueue[n]);*/
 
     // Remaining events will be processed on the next frame
     if (event_n == g.InputEventsQueue.Size)
@@ -8567,7 +8608,7 @@ static void ImGui::ErrorCheckNewFrameSanityChecks()
     IM_ASSERT(g.Style.WindowMenuButtonPosition == ImGuiDir_None || g.Style.WindowMenuButtonPosition == ImGuiDir_Left || g.Style.WindowMenuButtonPosition == ImGuiDir_Right);
 #ifndef IMGUI_DISABLE_OBSOLETE_KEYIO
     for (int n = ImGuiKey_NamedKey_BEGIN; n < ImGuiKey_COUNT; n++)
-        IM_ASSERT(g.IO.KeyMap[n] >= -1 && g.IO.KeyMap[n] < IM_ARRAYSIZE(g.IO.KeysDown) && "io.KeyMap[] contains an out of bound value (need to be 0..511, or -1 for unmapped key)");
+        IM_ASSERT(g.IO.KeyMap[n] >= -1 && g.IO.KeyMap[n] < ImGuiKey_LegacyNativeKey_END && "io.KeyMap[] contains an out of bound value (need to be 0..511, or -1 for unmapped key)");
 
     // Check: required key mapping (we intentionally do NOT check all keys to not pressure user into setting up everything, but Space is required and was only added in 1.60 WIP)
     if ((g.IO.ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) && g.IO.BackendUsingLegacyKeyArrays == 1)
@@ -8673,7 +8714,6 @@ void    ImGui::ErrorCheckEndFrameRecover(ImGuiErrorLogCallback log_callback, voi
             IM_ASSERT(window->IsFallbackWindow);
             break;
         }
-        IM_ASSERT(window == g.CurrentWindow);
         if (window->Flags & ImGuiWindowFlags_ChildWindow)
         {
             if (log_callback) log_callback(user_data, "Recovered from missing EndChild() for '%s'", window->Name);
@@ -12244,6 +12284,20 @@ ImGuiWindowSettings* ImGui::FindOrCreateWindowSettings(const char* name)
     if (ImGuiWindowSettings* settings = FindWindowSettings(ImHashStr(name)))
         return settings;
     return CreateNewWindowSettings(name);
+}
+
+void ImGui::AddSettingsHandler(const ImGuiSettingsHandler* handler)
+{
+    ImGuiContext& g = *GImGui;
+    IM_ASSERT(FindSettingsHandler(handler->TypeName) == NULL);
+    g.SettingsHandlers.push_back(*handler);
+}
+
+void ImGui::RemoveSettingsHandler(const char* type_name)
+{
+    ImGuiContext& g = *GImGui;
+    if (ImGuiSettingsHandler* handler = FindSettingsHandler(type_name))
+        g.SettingsHandlers.erase(handler);
 }
 
 ImGuiSettingsHandler* ImGui::FindSettingsHandler(const char* type_name)
@@ -17598,19 +17652,20 @@ void ImGui::ShowMetricsWindow(bool* p_open)
     {
         static ImRect GetTableRect(ImGuiTable* table, int rect_type, int n)
         {
+            ImGuiTableInstanceData* table_instance = TableGetInstanceData(table, table->InstanceCurrent); // Always using last submitted instance
             if (rect_type == TRT_OuterRect)                     { return table->OuterRect; }
             else if (rect_type == TRT_InnerRect)                { return table->InnerRect; }
             else if (rect_type == TRT_WorkRect)                 { return table->WorkRect; }
             else if (rect_type == TRT_HostClipRect)             { return table->HostClipRect; }
             else if (rect_type == TRT_InnerClipRect)            { return table->InnerClipRect; }
             else if (rect_type == TRT_BackgroundClipRect)       { return table->BgClipRect; }
-            else if (rect_type == TRT_ColumnsRect)              { ImGuiTableColumn* c = &table->Columns[n]; return ImRect(c->MinX, table->InnerClipRect.Min.y, c->MaxX, table->InnerClipRect.Min.y + table->LastOuterHeight); }
+            else if (rect_type == TRT_ColumnsRect)              { ImGuiTableColumn* c = &table->Columns[n]; return ImRect(c->MinX, table->InnerClipRect.Min.y, c->MaxX, table->InnerClipRect.Min.y + table_instance->LastOuterHeight); }
             else if (rect_type == TRT_ColumnsWorkRect)          { ImGuiTableColumn* c = &table->Columns[n]; return ImRect(c->WorkMinX, table->WorkRect.Min.y, c->WorkMaxX, table->WorkRect.Max.y); }
             else if (rect_type == TRT_ColumnsClipRect)          { ImGuiTableColumn* c = &table->Columns[n]; return c->ClipRect; }
-            else if (rect_type == TRT_ColumnsContentHeadersUsed){ ImGuiTableColumn* c = &table->Columns[n]; return ImRect(c->WorkMinX, table->InnerClipRect.Min.y, c->ContentMaxXHeadersUsed, table->InnerClipRect.Min.y + table->LastFirstRowHeight); } // Note: y1/y2 not always accurate
-            else if (rect_type == TRT_ColumnsContentHeadersIdeal){ImGuiTableColumn* c = &table->Columns[n]; return ImRect(c->WorkMinX, table->InnerClipRect.Min.y, c->ContentMaxXHeadersIdeal, table->InnerClipRect.Min.y + table->LastFirstRowHeight); }
-            else if (rect_type == TRT_ColumnsContentFrozen)     { ImGuiTableColumn* c = &table->Columns[n]; return ImRect(c->WorkMinX, table->InnerClipRect.Min.y, c->ContentMaxXFrozen, table->InnerClipRect.Min.y + table->LastFirstRowHeight); }
-            else if (rect_type == TRT_ColumnsContentUnfrozen)   { ImGuiTableColumn* c = &table->Columns[n]; return ImRect(c->WorkMinX, table->InnerClipRect.Min.y + table->LastFirstRowHeight, c->ContentMaxXUnfrozen, table->InnerClipRect.Max.y); }
+            else if (rect_type == TRT_ColumnsContentHeadersUsed){ ImGuiTableColumn* c = &table->Columns[n]; return ImRect(c->WorkMinX, table->InnerClipRect.Min.y, c->ContentMaxXHeadersUsed, table->InnerClipRect.Min.y + table_instance->LastFirstRowHeight); } // Note: y1/y2 not always accurate
+            else if (rect_type == TRT_ColumnsContentHeadersIdeal){ImGuiTableColumn* c = &table->Columns[n]; return ImRect(c->WorkMinX, table->InnerClipRect.Min.y, c->ContentMaxXHeadersIdeal, table->InnerClipRect.Min.y + table_instance->LastFirstRowHeight); }
+            else if (rect_type == TRT_ColumnsContentFrozen)     { ImGuiTableColumn* c = &table->Columns[n]; return ImRect(c->WorkMinX, table->InnerClipRect.Min.y, c->ContentMaxXFrozen, table->InnerClipRect.Min.y + table_instance->LastFirstRowHeight); }
+            else if (rect_type == TRT_ColumnsContentUnfrozen)   { ImGuiTableColumn* c = &table->Columns[n]; return ImRect(c->WorkMinX, table->InnerClipRect.Min.y + table_instance->LastFirstRowHeight, c->ContentMaxXUnfrozen, table->InnerClipRect.Max.y); }
             IM_ASSERT(0);
             return ImRect();
         }
